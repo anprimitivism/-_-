@@ -1,0 +1,361 @@
+---
+title: "new"
+output: html_document
+date: "2023-12-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE}
+library(tidytext)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(psych)
+
+# загружаем данные - метаданные песен взяты отсюда: https://www.kaggle.com/datasets/neisse/scrapped-lyrics-from-6-genres?resource=download 
+
+data = read_csv("~/minor2_2022/3-DH/final project/music_preferences2_2007.csv")
+users = read_csv("~/minor2_2022/3-DH/final project/users_lastfm.csv")
+pesni = read_csv("lyrics-data.csv")
+pevcy = read.csv('artists-data.csv')
+
+```
+# Описательные статистики
+
+```{r echo=FALSE}
+# строим гистограмму возраста и смотрим описательные статистики
+hist(users$age)
+describe(users)
+```
+Как мы видим, средний возраст слушателей составляет 25 лет и таких слушателей большинство, людей старше и младше меньше половины. 
+
+```{r echo=FALSE}
+#  количество наблюдений по странам
+country = users['country']
+table(country)
+```
+
+Большинство пользователей из США и Великобритании. Многие из Польши.
+
+```{r echo=FALSE}
+# строим гистограмму гендера и смотрим описательные статистики
+table(users$gender)
+```
+Мужчин в выборке больше, чем женщин. 
+
+```{r echo=FALSE}
+# смотрим возраст в подвыборке женщин и мужчин
+f = users %>% filter(gender == 'f')
+hist(f$age)
+summary(f$age)
+m = users %>% filter(gender == 'm')
+hist(m$age)
+summary(m$age)
+```
+Мужчины в выборке в среднем старше, чем женщины. 
+
+Учитывая специфику распределения гендера и возвраста в этой выборке, я выдвину следующую гипотезу:
+H1 - женщины в этой выборке будут чаще мужчин слушать песни про любовь и подростковую музыку. Мужчины будут предпочитать другие жанры. 
+
+Чтобы проверить эту гипотезу и понять, какие жанры, выявленные на основе текстов песен, предпочитают слушать представители разных гендеров, я проанализирую лирику песен с помощью STM.
+
+# Готовиим данные
+```{r echo=FALSE}
+# объединяем датасеты юзеров и истории прослушиваний
+full_set = left_join(data, users)
+```
+```{r echo=FALSE}
+# приводим данные в датасете full_set и скачанных метаданных к единому виду, чтобы потом объединить их по названию трека и его исполнителю и объединяем их
+pevcy$ALink = pevcy$Link
+full = left_join(pesni,pevcy, by = "ALink" )
+full$traname = tolower(gsub("[^[:alnum:]]", "", full$SName))
+full_set$traname = tolower(gsub("[^[:alnum:]]", "", data$traname))
+full$artname = tolower(gsub("[^[:alnum:]]", "", full$Artist))
+full_set$artname = tolower(gsub("[^[:alnum:]]", "", data$artname))
+merged_dataset = merge(full_set, full, by.x = c("traname", "artname"), by.y = c("traname", "artname"), all.x = TRUE)
+merged_dataset = merged_dataset[!(!grepl("[[:digit:]]", merged_dataset$artname) & !grepl("[[:alpha:]]", merged_dataset$artname)), ]
+merged_dataset = merged_dataset %>% 
+  na.omit(Lyric) %>% 
+  filter(language == 'en')
+
+# сохраняем отдельно лирику песен и метаданными
+lyrics = merged_dataset %>% na.omit() %>%
+  select(traname, artname, Genres, Lyric)
+lyrics <- unique(lyrics)
+```
+
+```{r echo=FALSE}
+# делим на слова и лемматизируем
+lyrics_words = lyrics %>%
+  unnest_tokens(word, Lyric) %>%
+  mutate(word_lemma = textstem::lemmatize_words(word))
+  
+
+# удаляем стоп-слова
+data("stop_words")
+names(stop_words)[1] = "word_lemma"
+lyrics_words = lyrics_words %>%
+  anti_join(stop_words)
+```
+
+Количество уникальных песен в нашем датасете:
+```{r echo=FALSE}
+songs = lyrics %>% 
+  group_by(traname) %>% 
+  summarise(count = n()) %>% 
+  arrange(-count)
+
+nrow(songs)
+```
+
+Количество уникальных сочетаний трек-исполнитель:
+```{r echo=FALSE}
+songs = lyrics %>% 
+  group_by(traname, artname) %>% 
+  summarise(count = n()) %>% 
+  arrange(-count)
+
+nrow(songs)
+```
+
+```{r echo=FALSE}
+# создаем столбец с названием трека и исполнителем - уникальным значением для каждого объекта анализа
+lyrics$name <- paste(lyrics$traname, "_", lyrics$artname)
+
+# сделаем табличку с данными по каждой песне
+songs_meta = lyrics %>% 
+  select(name, artname, traname, Lyric) %>% 
+  distinct()
+```
+```{r echo=FALSE}
+lyrics_words$name <- paste(lyrics_words$traname, "_", lyrics_words$artname)
+# считаем частотность слов
+words_count = lyrics_words %>% 
+  group_by(name, word_lemma) %>% 
+  summarise(count = n())
+```
+```{r echo=FALSE}
+# создаем матрицу терм-документ
+words_dfm <- words_count %>%
+  tidytext::cast_dfm(name, word_lemma, count)
+dim(words_dfm)
+```
+В нашей матрице терм-документ 19317 документа (по количеству уникальных значений трек-исполнитель) и 45853 слова.
+
+
+```{r echo=FALSE}
+# убираем самые частые и редкие слова
+words_dfm <- words_dfm %>% 
+  quanteda::dfm_trim(min_docfreq = 0.001, max_docfreq = 0.95, 
+  docfreq_type = 'prop') # пропорция слова в доках
+dim(words_dfm)
+```
+После очистки от самых частых и самых редких слов, их стало почти в 10 раз меньше: 4535. 
+
+```{r echo=FALSE}
+# готовим данные к стм
+w_dfm_df = quanteda::convert(words_dfm, to = "data.frame")
+dfm_docs = select(w_dfm_df, doc_id)
+names(dfm_docs) = "name"
+
+meta= lyrics %>%
+  select(name, Genres)
+
+dfm_docs = left_join(dfm_docs, meta, by = "name")
+dfm_docs=dfm_docs %>%
+  distinct()
+
+# присоединяем датафрейм к матрице в качестве метаданных
+words_dfm@docvars <- dfm_docs
+```
+
+# НУ, ПОЕХАЛИ. Строим STM модель
+
+мне кажется, что популярная музыка 2007 года не очень разнообразна в темах текстов, так что начнем с 7 тем.
+
+```{r echo=FALSE}
+library(stm)
+
+out <- quanteda::convert(words_dfm, to = 'stm') 
+
+names(out)
+names(out$meta)
+```
+```{r echo=FALSE}
+set.seed(666)
+stm_7 <- stm(documents = out$documents,
+      vocab = out$vocab,
+      data = out$meta,
+      prevalence =~ Genres, # какие переменные хотим использовать в качестве ковариатов
+      K = 7, # количество тем
+      verbose = TRUE) # показать прогресс
+```
+
+Топ-10 популярных слов в каждой из тем:
+```{r echo=FALSE}
+labelTopics(stm_7, c(1:7), n = 10)
+```
+
+Визуализируем:
+```{r echo=FALSE}
+stm::plot.STM(stm_7,type = "summary", xlim = c(0, 0.8))
+```
+
+Посмотрим качество модели:
+```{r echo=FALSE}
+stm::topicQuality(stm_7, documents = out$documents)
+```
+
+Как мы видим, значение exlusivity получилось высоким, а это значит, что выделенны жанры герметичны и мало пересекаются друг с другом. Как пишут здесь (https://bookdown.org/paul/computational_social_science/lab-structural-topic-model.html) - в правом углу собираются топики, где хороши оба показателя - а значит, модель на них сработала хорошо. Здесь плохо то, что exclusivity скачет и в этом плане топики 2 и 6 выделяются. Но несмотря на это содержательно очень нетурдно определить, чему посвящены песни из этого топика, в отличие от топиков 1 и 4.
+
+Анализ коварианта "жанр":
+```{r echo=FALSE}
+out$meta$Genres = as.factor(out$meta$Genres)
+
+prep <- estimateEffect(1:7 ~ Genres, stm_7, meta = out$meta, uncertainty = "Global")
+summary(prep)
+```
+Коэффициенты почти нигде не значимы, нельзя сказать, что ковариат определят, в какой топик попадет песня. "Настоящие" жанры слабо связаны с естественными, которые были выявлены на основе лирики.
+
+# Интерпретация тем
+
+В общем, количество выделенных топиков кажется оптимальным (я бы сделала k-means, но не успеваю). Мы можем назвать топики так:
+1. Песни про расставание/депрессивная музыка - прощание, сожаление, изменения в жизни.
+2. Суровый нефолк - войны, кровь, бог, демон, убийства
+3. Рэп - много междометий и мата
+4. Подростковая музыка - чувства, много глаголов, упоминаются college и depression
+5. Музыка про природу - солнце, небо, облака, мечты. Наверное, жизнерадостная музыка.
+6. Танцевальная музыка - танцевать, рок
+7. Любовная музыка - любовь, малышка, чувства, тоже много междометий
+
+
+# Проверка гипотезы
+```{r echo=FALSE}
+# сохраняем в датасет долю топиков в каждом тексте
+topicprop <- make.dt(stm_7, out$meta)
+topicprop = topicprop %>% tidyr::pivot_longer(2:8, names_to = "topic", values_to = "proportion")
+
+```
+```{r echo=FALSE}
+# объединяем датасет с данными юзеров, историей прослушивания, лирикой и принадлежностью к топикам.
+merged_dataset$name <- paste(merged_dataset$traname, "_", merged_dataset$artname)
+final = merge(merged_dataset, topicprop, by.x = "name", by.y = "name", all.x = TRUE)
+```
+
+Теперь проверим гипотезы и посмотрим, какие группы людей чаще всего слушают какие песни.
+```{r echo=FALSE}
+# соберем подвыборки треков, относящихся к определенному топику. Пороговое значение поставим 0.2 (3-й квартиль выборки)
+
+topic_1 = final %>% dplyr::filter(topic == 'Topic1' & proportion > 0.2)
+
+```
+
+```{r echo=FALSE}
+save(out, file = "./out.RData")
+save(stm_7, file = "./stm_7.RData")
+```
+Связь между возрастом и доли топика 1 в треке для мужчин и для женщин:
+```{r}
+ggplot(topic_1, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Значимых различий в предпочтениях для мужчин и женщин нет, и чаще всего такую музыку слушают молодые люди - но это, скорее всего, связано с несбалансированностью выборки по возрасту.
+
+
+```{r echo=FALSE}
+topic_2 = final %>% dplyr::filter(topic == 'Topic2' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 2 в треке для мужчин и для женщин:
+```{r echo=FALSE}
+ggplot(topic_2, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Здесь тоже нет никаких значимых различий, хотя жанр получился очень специфичный.
+
+
+```{r echo=FALSE}
+topic_3 = final %>% dplyr::filter(topic == 'Topic3' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 3 в треке для мужчин и для женщин:
+```{r echo=FALSE}
+ggplot(topic_3, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Здесь тоже нет значимых различий для гендеров, но возрастная динамика очень забавная: слушатели очень увлекаются репом в возрасте около 20 (мужчины чуть позже женщин), а потом интерес быстро угасает.
+
+
+```{r echo=FALSE}
+topic_4 = final %>% dplyr::filter(topic == 'Topic4' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 4 в треке для мужчин и для женщин:
+```{r echo=FALSE}
+ggplot(topic_4, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Ура! Наконец-то что-то новенькое, но с очень широкими доверительными интервалами, и поэтому не вызывающее доверие. Женщины стабильно средне интересуются тем, что я назвала подростковой и слегка депрессивной музыкой, А мужчины начинают очень интересоваться этой музыкой в возрасте около 30 лет. (или это все один человек, который прослушал трек подобного жанра несколько тысяч раз). 
+
+
+
+```{r echo=FALSE}
+topic_5 = final %>% dplyr::filter(topic == 'Topic5' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 5 в треке для мужчин и для женщин:
+```{r echo=FALSE}
+ggplot(topic_5, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Женщинам намного интереснее "жизнерадостная музыка про природу".
+
+```{r echo=FALSE}
+topic_6 = final %>% dplyr::filter(topic == 'Topic6' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 6 в треке для мужчин и для женщин:
+```{r echo=FALSE}
+ggplot(topic_6, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+
+Мужчинам нравится танцевальная музыка больше чем женщинам, пик приходится на 25 лет.
+
+
+```{r echo=FALSE}
+topic_7 = final %>% dplyr::filter(topic == 'Topic7' & proportion > 0.2)
+```
+Связь между возрастом и доли топика 7 в треке для мужчин и для женщин:
+
+```{r}
+ggplot(topic_7, aes(x=age, y=proportion)) + 
+  geom_smooth() +
+  facet_wrap("gender")
+```
+Жещины часто слушают любовную музыку около 20, после 20 интерес сильно падает и возрастает чуть выше уровня 20 лет после 30. Мужчины же слушают ее примерно с той же долей, что у девушек в 20 лет, примерно все время, а после 30 доля этой музыки тоже возрастает. 
+
+# Вывод
+
+Действительно удалось увидеть какие-то гендерные предпочтения, но не совсем такие, как я ожидала. Я смотрела, как меняется доля одно или иного топика среди женщин и мужчин в разных возрастных группах в подгруппах, где этот топик уже составляет значительную долю (0.2). То есть, среди каких гендерно-возрастных групп тот или иной жанр выявленный на основе лирики треков получает максимальную популярность. Для этого я использовала графики с нелинейным трендом - самый простой, первичный визуальный тест. Какие-то значимые визуальные гендерные различия в музыкальных предпочтениях были только у части топиков:
+
+Топик 4 - "подростковая музыка, стабильно популярна среди женщин, особо популярно у мужчин около 25 лет (сризис четверти жизни, получается)
+
+топик 5: музыка про природу стабильно популярнее у женщин, у мужчин распространенность этого жанра скачет. 
+
+Топик 6: танцевальная музыка популярнее у мужчин. Особенно в 25
+
+Топик 7: Мужчины и женщины слушают любовную музыку примерно одинаково часто, но женщины после 30 чаще всех.
+
+
+
+
+
+
+
